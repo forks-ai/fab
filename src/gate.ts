@@ -64,12 +64,37 @@ const VERDICT_RE = /^\s*GATE_VERDICT:\s*(APPROVE|REJECT|REQUEST_CHANGES)\s*$/im;
 const FEEDBACK_RE =
   /^\s*GATE_FEEDBACK:\s*([\s\S]+?)(?=\n\s*(?:GATE_|TRANSCRIPTS:|CITATIONS:|QUALITY_GRADES:)|\n\s*$|$)/im;
 
-// Presence of the header plus at least one indented or dash-prefixed
-// child line. An empty `TRANSCRIPTS:` header with nothing under it does
-// not count as evidence.
+// The field each block must carry, taken from EVIDENCE_CONTRACT's own tuple
+// definitions rather than from a list of ways to write "nothing". A blocklist
+// of placeholder words is narrower than the class by construction — the next
+// spelling walks through it — while the required key is the thing the
+// downstream parser already needs: parseCitations keys entries on `file:`, and
+// a transcript with no `command:` names no command that was run.
+const EVIDENCE_KEY = {
+  TRANSCRIPTS: /^\s*(?:-\s*)?command\s*:/im,
+  CITATIONS: /^\s*(?:-\s*)?file\s*:/im,
+} as const;
+
+/**
+ * True when the block is present AND carries at least one of the fields the
+ * contract defines for it.
+ *
+ * Header-plus-any-child-line was the previous test, and it accepted every
+ * placeholder a role could type — `none`, `n/a`, `[]`, `-`, and the three
+ * phrases EVIDENCE_CONTRACT itself names as auto-REJECT triggers. Indentation
+ * is deliberately not constrained beyond locating the block: a role that
+ * writes its evidence at column zero or with tabs has still produced evidence,
+ * and failing it would be failing formatting rather than substance.
+ */
 function hasEvidenceBlock(output: string, header: 'TRANSCRIPTS' | 'CITATIONS'): boolean {
-  const re = new RegExp(`^\\s*${header}:\\s*\\n(?:\\s{2,}|\\s*-\\s)`, 'im');
-  return re.test(output);
+  const headerRe = new RegExp(`^[ \\t]*${header}:[ \\t]*$`, 'im');
+  const m = output.match(headerRe);
+  if (!m || m.index === undefined) return false;
+  const rest = output.slice(m.index + m[0].length);
+  // The block runs to the next top-level block header, or to the end.
+  const next = rest.match(/^[ \t]*(?:GATE_[A-Z]+|TRANSCRIPTS|CITATIONS|QUALITY_GRADES):/m);
+  const block = next && next.index !== undefined ? rest.slice(0, next.index) : rest;
+  return EVIDENCE_KEY[header].test(block);
 }
 
 /**
@@ -382,14 +407,31 @@ export function mergeGateVerdicts(verdicts: GateVerdict[]): GateResult {
     };
   }
 
+  const format = (v: GateVerdict) =>
+    `[${v.role}${v.advisory ? ' (advisory)' : ''}] ${v.verdict}: ${v.feedback}`;
+
   const binding = verdicts.filter((v) => !v.advisory);
   const advisory = verdicts.filter((v) => v.advisory);
 
+  // Every voter advisory means nothing counted. The `all APPROVE` arm below is
+  // vacuously true over an empty set, so without this a ballot of four REJECTs
+  // downgraded to advisory ships the PR. A gate with no binding voter has not
+  // examined the change; it has not passed it.
+  if (binding.length === 0) {
+    return {
+      decision: 'reject',
+      feedback:
+        `Merge gate ran with no binding verdict — all ${verdicts.length} voter(s) were advisory, ` +
+        `so nothing counted toward the decision.` +
+        // Unconditional: the zero-verdict case returned above, so an empty
+        // binding set means every verdict is advisory and this list is never
+        // empty here.
+        `\n\nAdvisory:\n${advisory.map(format).join('\n')}`,
+    };
+  }
+
   const rejects = binding.filter((v) => v.verdict === 'REJECT');
   const changes = binding.filter((v) => v.verdict === 'REQUEST_CHANGES');
-
-  const format = (v: GateVerdict) =>
-    `[${v.role}${v.advisory ? ' (advisory)' : ''}] ${v.verdict}: ${v.feedback}`;
   const advisoryNotes =
     advisory.length > 0 ? '\n\nAdvisory:\n' + advisory.map(format).join('\n') : '';
 
@@ -531,6 +573,12 @@ export function parseQualityGrades(output: string): Record<string, Grade> {
 export interface GradeDrift {
   drifted: string[]; // dimensions where |internal - external| > 1 letter
   maxDrift: number; // largest letter-level gap observed
+  compared: string[]; // dimensions actually scored on both sides
+  // Dimensions the cold reviewer graded and the internal gate did not — absent
+  // block, or a one-sided N/A. Reported rather than skipped: the count of what
+  // was examined is derived here, from the grades themselves, so a caller
+  // cannot mistake an unexamined dimension for an agreeing one.
+  uncompared: string[];
 }
 
 /**
@@ -567,15 +615,27 @@ export function compareGrades(
 ): GradeDrift {
   const dims = new Set([...Object.keys(internal), ...Object.keys(external)]);
   const drifted: string[] = [];
+  const compared: string[] = [];
+  const uncompared: string[] = [];
   let maxDrift = 0;
   for (const d of dims) {
     const i = internal[d];
     const e = external[d];
-    if (!i || !e) continue;
-    if (i === 'N/A' || e === 'N/A') continue;
+    // The external reviewer declining to score a dimension leaves nothing to
+    // calibrate against, and it is the reference rather than the graded party —
+    // not an exemption the gate took for itself.
+    if (!e || e === 'N/A') continue;
+    // It did score it. An internal grade that is missing, or N/A against a
+    // scored reference, is the graded side excusing itself from the one check
+    // that exists to catch it. Record it; do not silently drop it.
+    if (!i || i === 'N/A') {
+      uncompared.push(d);
+      continue;
+    }
+    compared.push(d);
     const diff = Math.abs(letterLevel(i) - letterLevel(e));
     if (diff > maxDrift) maxDrift = diff;
     if (diff > 1) drifted.push(d);
   }
-  return { drifted, maxDrift };
+  return { drifted, maxDrift, compared, uncompared };
 }
