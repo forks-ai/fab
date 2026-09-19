@@ -8,6 +8,8 @@
 // workflow start so agents never have to create, search for, or verify
 // the repo themselves.
 
+import { canonicalRepoPath, describeRefusal, repoPathRefusal } from './paths.js';
+
 const GITHUB_API = 'https://api.github.com';
 
 /**
@@ -21,15 +23,41 @@ const GITHUB_API = 'https://api.github.com';
  * exists and is a github_repository.
  */
 export function parseGitHubUrl(url: string): { owner: string; repo: string } {
+  const parsed = tryParseGitHubUrl(url);
+  if (!parsed) throw new Error(`Unrecognized GitHub URL: ${url}`);
+  return parsed;
+}
+
+/**
+ * The same parse, for callers that treat "not a GitHub remote" as an answer
+ * rather than an error.
+ *
+ * Two checkouts of one repository disagree on the form their remote is written
+ * in — scp-like or URL, with or without userinfo, suffix, port or trailing
+ * slash — and a comparison that rejected a form would report a genuine checkout
+ * as a different repository. The host is matched without regard to case because
+ * DNS is; the owner and repository are returned as written, since a caller
+ * comparing them decides for itself what case means.
+ *
+ * The forms accepted are the ones below and nothing else: a remote pointing at
+ * a GitHub Enterprise host, or through a proxy that rewrites the host, is not
+ * recognised and is a different repository as far as this is concerned.
+ */
+export function tryParseGitHubUrl(url: string): { owner: string; repo: string } | null {
   const cleaned = url
     .trim()
+    .replace(/\/$/, '')
     .replace(/\.git$/, '')
     .replace(/\/$/, '');
-  const httpsMatch = cleaned.match(/^https?:\/\/github\.com\/([^/]+)\/([^/]+)$/);
-  if (httpsMatch) return { owner: httpsMatch[1], repo: httpsMatch[2] };
-  const sshMatch = cleaned.match(/^git@github\.com:([^/]+)\/([^/]+)$/);
-  if (sshMatch) return { owner: sshMatch[1], repo: sshMatch[2] };
-  throw new Error(`Unrecognized GitHub URL: ${url}`);
+  // scp-like, with or without userinfo: github.com:owner/repo, git@github.com:owner/repo
+  const scp = cleaned.match(/^(?:[^@/]+@)?github\.com:([^/]+)\/([^/]+)$/i);
+  if (scp) return { owner: scp[1], repo: scp[2] };
+  // URL forms: https://, http://, ssh://, git://, with optional userinfo and port
+  const urlLike = cleaned.match(
+    /^(?:https?|ssh|git):\/\/(?:[^@/]*@)?github\.com(?::\d+)?\/([^/]+)\/([^/]+)$/i,
+  );
+  if (urlLike) return { owner: urlLike[1], repo: urlLike[2] };
+  return null;
 }
 
 /**
@@ -139,11 +167,21 @@ export async function fetchRepoFile(
   path: string,
   ref: string,
 ): Promise<string | null> {
-  const encodedPath = path
-    .split('/')
-    .filter((seg) => seg.length > 0)
-    .map(encodeURIComponent)
-    .join('/');
+  // The path is a `file:` a model wrote. `encodeURIComponent` leaves a dot
+  // alone, so a parent segment survives encoding intact and the dot-segment
+  // removal every URL parser applies then walks the request off the pinned
+  // `/repos/{owner}/{repo}/contents/` prefix — to another repository, or to an
+  // account-wide endpoint, carrying this repository's token. Refusing the value
+  // is what keeps the request inside the repository under review; refusing it
+  // before the request is what keeps the reply from being an oracle.
+  const refusal = repoPathRefusal(path);
+  if (refusal) {
+    process.stderr.write(
+      `[git] refusing to read a cited path that ${describeRefusal(refusal)}: ${JSON.stringify(path)}\n`,
+    );
+    return null;
+  }
+  const encodedPath = canonicalRepoPath(path)!.split('/').map(encodeURIComponent).join('/');
   const res = await fetch(
     `${GITHUB_API}/repos/${owner}/${repo}/contents/${encodedPath}?ref=${encodeURIComponent(ref)}`,
     {

@@ -10,6 +10,7 @@ import {
   type InferenceBackend,
 } from '../inference.js';
 import { isTerminal, textOf, translateSdkMessage } from './sdk-events.js';
+import { boundEvents, resolveSessionDeadlines } from './deadline.js';
 import { buildHttpMcpServers, type HttpMcpServer } from '../mcp.js';
 
 /**
@@ -41,6 +42,14 @@ import { buildHttpMcpServers, type HttpMcpServer } from '../mcp.js';
  * Bedrock (see `src/inference.ts`); the default is the Anthropic API.
  */
 export class SdkRuntime implements AgentRuntime {
+  /**
+   * How the Agent SDK is obtained. Defaulted to the real loader, so production
+   * takes it; a caller supplies one to observe what `runRoleSession` hands the
+   * query, which is the only place the configured spend ceiling is read and
+   * passed down.
+   */
+  constructor(private readonly loadSdkModule: () => Promise<AgentSdkModule> = loadSdk) {}
+
   async runRoleSession(
     role: TeamRole,
     message: string,
@@ -57,10 +66,10 @@ export class SdkRuntime implements AgentRuntime {
     const backend = resolveInferenceBackend();
     const model = resolveModelId(member.model, backend);
     // Native per-run budget: the SDK stops the loop with an error_max_budget_usd
-    // result when this USD cap is exceeded. This is how budget enforcement
-    // reaches the sdk/sdk-k8s transports — managed-agents enforces it via span
-    // accumulation + interrupt in streamSessionWithAdvisor, which never fires
-    // here (these transports emit no cost spans).
+    // result when this USD cap is exceeded. It is a second ceiling, independent
+    // of the one the pipeline applies — streamSessionWithAdvisor accumulates the
+    // per-request cost spans this transport emits and interrupts on breach, and
+    // that path reaches every transport that emits them.
     const budgetUsd = await getBudgetLimit();
     // Wire the role's MCP servers into the in-process loop. Without this the sdk
     // transport ran with NO MCP tools — roles lost github/linear/etc. and could
@@ -73,7 +82,7 @@ export class SdkRuntime implements AgentRuntime {
       );
     }
 
-    const sdk = await loadSdk();
+    const sdk = await this.loadSdkModule();
     const session = new SdkAgentSession(
       sdk,
       model,
@@ -170,6 +179,8 @@ export class SdkAgentSession implements AgentSession {
   private closed = false;
   private sdkQuery: SdkQuery | null = null;
   private capturedSessionId: string | null = null;
+  /** Turns already charged for; one API turn arrives as several messages. */
+  private readonly seenTurns = new Set<string>();
 
   constructor(
     private readonly sdk: AgentSdkModule,
@@ -220,7 +231,10 @@ export class SdkAgentSession implements AgentSession {
   }
 
   get events(): AsyncIterable<AgentEvent> {
-    return this.translateEvents();
+    // The bound is structural rather than a parameter a caller may omit.
+    // `maxBudgetUsd` is a spend cap and is opt-in; neither answers how long a
+    // stalled loop may sit here, so the only way to iterate it is bounded.
+    return boundEvents(this.translateEvents(), this, resolveSessionDeadlines(process.env));
   }
 
   async sendInput(input: UserEvent): Promise<void> {
@@ -250,6 +264,16 @@ export class SdkAgentSession implements AgentSession {
   }
 
   async interrupt(): Promise<void> {
+    await this.stop();
+  }
+
+  /**
+   * End the agent loop and let the SDK's process shut down.
+   *
+   * Closing the input iterable is what releases that process; interrupting the
+   * query alone leaves it waiting for a message that will not arrive.
+   */
+  async stop(): Promise<void> {
     if (this.sdkQuery) {
       await this.sdkQuery.interrupt();
     }
@@ -310,16 +334,29 @@ export class SdkAgentSession implements AgentSession {
     if (!this.sdkQuery) {
       throw new Error('SdkRuntime: session has not been started');
     }
-    for await (const raw of this.sdkQuery) {
-      const event = translateSdkMessage(raw, (id) => {
-        this.capturedSessionId = id;
-      });
-      if (event) yield event;
-      // After a terminal result the loop ends naturally; close the input
-      // iterable so the SDK's process can shut down cleanly.
-      if (event && isTerminal(event)) {
-        this.closeInput();
+    try {
+      for await (const raw of this.sdkQuery) {
+        const events = translateSdkMessage(
+          raw,
+          (id) => {
+            this.capturedSessionId = id;
+          },
+          this.seenTurns,
+        );
+        for (const event of events) {
+          yield event;
+          // After a terminal result the loop ends naturally; close the input
+          // iterable so the SDK's process can shut down cleanly.
+          if (isTerminal(event)) {
+            this.closeInput();
+          }
+        }
       }
+    } finally {
+      // A consumer that stops reading leaves the input iterable open and the
+      // SDK's process with it, so closing cannot depend on reaching a terminal
+      // event.
+      this.closeInput();
     }
   }
 }

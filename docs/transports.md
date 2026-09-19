@@ -1,6 +1,6 @@
 # Transports
 
-Fab runs the same role definitions + workflow code against four transports:
+Fab runs the same role definitions + workflow code against each of these transports:
 
 - **`managed-agents`** (default) — Anthropic-hosted REST API. Sessions and sandboxes live on Anthropic infrastructure.
 - **`sdk`** — `@anthropic-ai/claude-agent-sdk` running the agent loop in fab's own process. Sessions run in-process; tools touch the working directory.
@@ -47,9 +47,10 @@ In **sdk** and **claude-cli** modes you do not run `fab deploy`. The role's syst
 | **MCP servers**               | Server registry in `src/mcp.ts`. Vault-mediated auth at session time.                 | SDK accepts `mcpServers` option directly. Auth flows through env / vaults.                                                                            | Fab generates a per-session JSON config file passed to `--mcp-config`. Auth flows through `MCP_GATEWAY_TOKEN` + per-server env vars.                   |
 | **Threading**                 | `session_thread_id` is part of every event. Multi-thread coordinators expose threads. | SDK does not surface threading distinctly — assistant messages have `parent_tool_use_id` for subagent context.                                        | Same as the SDK runtime — no first-class threading event surface.                                                                                      |
 | **Multiagent coordinators**   | Native `multiagent: { type: "coordinator" }` (20-agent cap, 1-level deep).            | Subagents via `Agent` tool + `agents` option.                                                                                                         | Same as the SDK runtime; the Task / Agent tool inside `claude -p` dispatches subagents.                                                                |
-| **Cost tracking**             | `span.model_request_end` per request, summed for in-session budget enforcement.       | `total_cost_usd` in result message.                                                                                                                   | `total_cost_usd` in result message.                                                                                                                    |
+| **Session wall clock**        | Idle + total bounds on the event stream (`src/runtimes/deadline.ts`). The SSE reconnect in `src/api.ts` carries its own per-attempt bound. | Idle + total bounds on the event stream. `maxBudgetUsd` is a spend cap, not a clock. | Idle + total bounds on the event stream. Expiry sends `SIGINT`, escalating to `SIGKILL` if the subprocess does not exit. |
+| **Cost tracking**             | `span.model_request_end` per model request, emitted by the API and summed while the session runs.                 | `span.model_request_end` per API turn, derived from the `usage` an assistant message carries and charged once per `message.id`, plus `total_cost_usd` on the result. | Same as the SDK runtime — the two speak one message shape and share one translator. |
 | **Advisor escalation**        | Opus call via `consult_advisor` custom tool.                                          | Same tool path; SDK invokes the custom tool, fab handles the Opus call.                                                                               | Same — the tool is part of the role's system prompt; fab intercepts.                                                                                   |
-| **Budget enforcement**        | Session interrupt on budget breach.                                                   | Same interrupt path via SDK `Query.interrupt()`.                                                                                                      | `SIGINT` to the subprocess via `proc.kill('SIGINT')`. Claude Code emits a result before exiting.                                                       |
+| **Budget enforcement**        | Accumulated span cost is compared against the limit on every request; a breach interrupts the session. | Same comparison, on the same spans. The SDK's native `maxBudgetUsd` is a second, independent ceiling.  | Same comparison, on the same spans. A breach interrupts, which sends `SIGINT` and escalates to `SIGKILL`. |
 | **Git resources**             | Cloud-mounted via session `resources`.                                                | Operate against your local cwd.                                                                                                                       | Same as the SDK runtime — cwd is the working filesystem. Repos mounted via `--add-dir`.                                                                |
 | **Vaults**                    | First-class via `vault_ids` on session create.                                        | No vault concept; env vars supply credentials to MCP servers directly.                                                                                | Same as the SDK runtime — the per-session MCP config inlines the gateway bearer.                                                                       |
 | **Deploy step**               | `fab deploy` uploads skills + agents to Anthropic.                                    | Not needed.                                                                                                                                           | Not needed.                                                                                                                                            |
@@ -68,6 +69,17 @@ Claude CLI runtime accepts these env vars on top of the standard fab set:
 | `FAB_CLAUDE_PATH`        | `claude` (PATH lookup) | Override the binary path                                                                                                                                                         |
 | `FAB_CLAUDE_EXTRA_ARGS`  | unset                  | Space-separated extra flags appended to every spawn (escape hatch for power users)                                                                                               |
 | `FAB_CLAUDE_MCP_DIR`     | `os.tmpdir()`          | Directory for per-session MCP config JSON files                                                                                                                                  |
+
+## Session wall clocks
+
+Every transport bounds a session's event stream with two clocks, because neither answers the other's question. `FAB_SESSION_IDLE_MS` bounds the gap between events — a session that has produced nothing is stalled rather than working. `FAB_SESSION_TOTAL_MS` bounds the whole session however live it looks, which is what catches a loop that emits a heartbeat and makes no progress. Expiry stops the session and ends the stream with a `session.error` naming the clock; output already produced is returned and marked partial.
+
+| Env var                 | Default              | Effect                                                                          |
+| ----------------------- | -------------------- | ------------------------------------------------------------------------------- |
+| `FAB_SESSION_IDLE_MS`   | `900000` (15 min)    | Longest gap between events before the session is treated as hung. The floor is the longest a single tool call plausibly takes without emitting anything — `src/prehook.ts` gives one build command the same 15 minutes. |
+| `FAB_SESSION_TOTAL_MS`  | `1800000` (30 min)   | Longest a single session may run. Matches `LOG_FOLLOW_TIMEOUT_MS`, the ceiling the k8s transport places on one session. |
+
+Both take whole milliseconds and must be at least 1000; anything else is rejected at session start rather than read as a duration an operator cannot predict. `FAB_RUNTIME=sdk-k8s` forwards both into the session pod, so an in-pod session is bounded by the same numbers as the dispatcher.
 
 ## Inference backend
 
@@ -139,7 +151,7 @@ The operator runs the session pods in the Platform's tenant namespace (`tenants-
 
 ## What's the same across all transports
 
-- **Roster.** All four transports run the same roles from `src/team/`.
+- **Roster.** Every transport runs the same roles from `src/team/`.
 - **Workflows.** `src/workflows.ts` is transport-agnostic. The same revision-loop, merge-gate, and external-reviewer calibration code runs in every mode.
 - **Skill overlay.** The overlay chain (`$FAB_SKILLS_DIR` → `~/.fab/skills/` → `<cwd>/.fab/skills/` → bundled `fab/skills/`) resolves identically.
 - **Gate logic.** `src/gate.ts` — pure functions, no transport coupling.

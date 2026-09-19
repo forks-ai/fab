@@ -7,9 +7,7 @@ import {
   getMemoryResource,
   getRepos,
   getVaultIds,
-  loadState,
 } from '../state.js';
-import { collectSessionMetrics } from '../perf.js';
 
 /**
  * Agent runtime implementation against the Anthropic Managed Agents REST API.
@@ -65,17 +63,6 @@ export class ManagedAgentsRuntime implements AgentRuntime {
   resumeSession(sessionId: string): AgentSession {
     return new ManagedAgentSession(this.api, sessionId);
   }
-
-  /**
-   * The managed-agents transport exposes the per-session usage + event history
-   * (`getSession` / `listEvents`) that the per-role perf table needs. Loads the
-   * workspace state to map the session's agent back to its role, then folds the
-   * session into `.fab-perf.json`.
-   */
-  async collectSessionMetrics(sessionId: string): Promise<void> {
-    const state = await loadState();
-    await collectSessionMetrics(this.api, sessionId, state);
-  }
 }
 
 class ManagedAgentSession implements AgentSession {
@@ -89,9 +76,11 @@ class ManagedAgentSession implements AgentSession {
   }
 
   async sendInput(input: UserEvent): Promise<void> {
-    // Map the transport-agnostic UserEvent shape to the existing api.ts
-    // helpers where they exist, fall through to the generic events endpoint
-    // for any input shape the helpers don't cover.
+    // Every UserEvent shape this transport carries has its own api.ts helper.
+    // A shape with none throws rather than being dropped: the generic events
+    // endpoint those helpers post to is private to the client, so nothing here
+    // can reach it, and silently accepting a shape would report a delivery that
+    // did not happen.
     switch (input.type) {
       case 'user.message':
         await this.api.sendMessage(this.id, textOf(input.content));

@@ -20,13 +20,21 @@ import {
   compareGrades,
   parseCitations,
   aggregateGrades,
+  parseSelfEval,
 } from './gate.js';
 import type { GateVerdict, Grade, GradeDrift, FileReader } from './gate.js';
 import { appendQualityRun } from './quality.js';
-import { formatPreHookTranscripts, type PreHookResult, runFourPhasePreHook } from './prehook.js';
+import {
+  formatPreHookTranscripts,
+  type PreHookResult,
+  runFourPhasePreHook,
+  shellRunner,
+} from './prehook.js';
+import { type GateArtifact, resolveGateWorkspace, type ShellRunner } from './workspace.js';
 import { slugForBranch, createBranchIfMissing, fetchRepoFile } from './git.js';
 import { estimateCost } from './pricing.js';
-import { unsafeSourceDirs, untrustedBlock } from './guardrails.js';
+import { recordSessionMetrics } from './perf.js';
+import { sourceDirRefusal, unsafeSourceDirs, untrustedBlock } from './guardrails.js';
 
 const SUPPORTED_LANGUAGES: ReadonlyArray<Language> = [
   'typescript',
@@ -72,6 +80,16 @@ export type RoleRunner = (
   role: TeamRole,
   message: string,
   workflowName: string,
+  /**
+   * Which attempt this is: 0 for a role's first run, and one more for each time
+   * a gate sent the work back.
+   *
+   * A parameter rather than something read off the output, because a revision
+   * is a decision this file makes. The loop that revises cannot advance without
+   * incrementing it, so a run that revised eight times cannot be recorded as a
+   * run that revised none.
+   */
+  attempt: number,
 ) => Promise<string>;
 
 export interface WorkflowOptions {
@@ -993,7 +1011,8 @@ export async function executeWorkflow(
       console.log(
         `${RED}${BOLD}Halted: ${unsafe.length} source_dirs entr(y/ies) are not repo-relative directories.${RESET}`,
       );
-      for (const d of unsafe) console.log(`${DIM}  rejected: ${JSON.stringify(d)}${RESET}`);
+      for (const d of unsafe)
+        console.log(`${DIM}  rejected: ${JSON.stringify(d)} — ${sourceDirRefusal(d)}${RESET}`);
       return {
         ok: false,
         reason: `${workflow.name} halted: source_dirs must be one-line, repo-relative directory paths; ${unsafe.length} entr(y/ies) were not.`,
@@ -1049,6 +1068,7 @@ ${renderWorkflowContext(head, entries)}
 Your task:
 ${s.instruction}`,
               workflow.name,
+              attempt,
             ).then((out) => ({ role: s.role, out })),
           ),
         );
@@ -1077,6 +1097,7 @@ ${renderWorkflowContext(head, entries)}
 Your task:
 ${step.instruction}`,
             workflow.name,
+            attempt,
           );
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
@@ -1161,6 +1182,8 @@ All four merge-gate roles have APPROVED. Open the PR now.
 
 Return the PR URL prominently in your response.`,
           workflow.name,
+          // The release step runs once, after the gate has already approved.
+          0,
         );
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
@@ -1332,19 +1355,45 @@ async function buildCitationReader(
  * GitHub Contents API — fabricated fragments downgrade the verdict to REJECT.
  */
 /**
- * Resolve and run the four-phase pre-hook against the local workspace.
+ * Run the four-phase pre-hook against the artifact under gate.
  *
- * `FAB_WORKSPACE` names the checkout when one exists; otherwise the process
- * working directory is used, which is the tree the sdk and claude-cli
- * transports already operate in. Under managed-agents the work happens in a
- * cloud sandbox and there is nothing here to run, which surfaces as
- * `unavailable` — reported to the roles and to the PR as an unverified build,
- * never as a passing one.
+ * The tree is named by the artifact, never by where the process was launched.
+ * `FAB_WORKSPACE` is used when the checkout it names proves to be the same
+ * repository, the same branch, the same commit as the remote branch, and clean;
+ * anything else is passed over with the reason, and the branch is fetched. The
+ * transcripts the gate roles are told to treat as observed are transcripts of
+ * the thing they are reviewing either way.
+ *
+ * With no artifact to name — a gate invoked without a repository and branch —
+ * the result is `unavailable`, reported to the roles and to the PR as an
+ * unverified build, never as a passing one.
  */
-async function resolvePreHook(): Promise<PreHookResult> {
-  const cwd = process.env.FAB_WORKSPACE ?? process.cwd();
+export async function runGatePreHook(
+  artifact: GateArtifact | null,
+  // Every git command this reaches for: the questions that establish which tree
+  // this is, and the fetch that obtains one. Overridden only where a test needs
+  // both answered locally; the phases themselves always run as real
+  // subprocesses, because `runFourPhasePreHook` is called without a runner.
+  deps: { run?: ShellRunner } = {},
+): Promise<PreHookResult> {
+  // Resolved before anything is acquired: a throw here would otherwise leave a
+  // fetched checkout, and the token file beside it, with no owner to release
+  // them.
   const language = await getProjectLanguage();
-  return runFourPhasePreHook({ cwd, language });
+  const workspace = await resolveGateWorkspace({
+    artifact,
+    declared: process.env.FAB_WORKSPACE ?? null,
+    run: deps.run ?? shellRunner,
+    note: (message) => console.log(`${YELLOW}${message}${RESET}`),
+  });
+  if (workspace.kind === 'unavailable') {
+    return { status: 'unavailable', transcripts: [], reason: workspace.reason };
+  }
+  try {
+    return await runFourPhasePreHook({ cwd: workspace.cwd, language });
+  } finally {
+    await workspace.release();
+  }
 }
 
 export async function runMergeGate(
@@ -1354,7 +1403,7 @@ export async function runMergeGate(
   initialContext: string,
   citationSource?: CitationSource | null,
   runRole: RoleRunner = runRoleSession,
-  preHook: () => Promise<PreHookResult> = resolvePreHook,
+  preHook: (artifact: GateArtifact | null) => Promise<PreHookResult> = runGatePreHook,
 ): Promise<GateResult> {
   const gateRoles = profile === 'code' ? CODE_GATE_ROLES : DOCS_GATE_ROLES;
 
@@ -1363,7 +1412,7 @@ export async function runMergeGate(
   // It is the only step in the gate that observes rather than asks a role to
   // report, so its transcripts — not a role's account of them — are what the
   // rest of the gate reads.
-  const pre = await preHook();
+  const pre = await preHook(citationSource ?? null);
   if (pre.status === 'failed') {
     console.log(`${RED}${BOLD}Four-phase pre-hook FAILED: ${pre.reason}${RESET}`);
     return {
@@ -1410,6 +1459,7 @@ ${context}
 Your task:
 Review the PR candidate against your role's merge-gate criteria per FACTORY_PREAMBLE. End your response with the full block: GATE_VERDICT, GATE_FEEDBACK, TRANSCRIPTS, CITATIONS, QUALITY_GRADES — EVIDENCE_CONTRACT auto-downgrades APPROVE/REQUEST_CHANGES without transcripts + citations to REJECT.`,
           workflowName,
+          attempt,
         );
       } catch (err) {
         // A gate role that can't run yields no verdict, which parseGateVerdict
@@ -1520,7 +1570,7 @@ async function recordQuality(
 
 /**
  * Cold-context external-reviewer calibration. Runs AFTER the four gate
- * roles approve. The external-reviewer grades the 9 QUALITY_RUBRIC
+ * roles approve. The external-reviewer grades the 10 QUALITY_RUBRIC
  * dimensions against the post-merge tree without seeing any internal
  * verdicts. The pipeline compares its grades against the aggregate of
  * internal grades; >1-letter drift on any dimension blocks release.
@@ -1560,6 +1610,9 @@ ${context}
 Your task:
 Apply the 10-dimension QUALITY_RUBRIC to the post-merge tree. Output the QUALITY_GRADES block with all 10 dimensions (N/A where a dimension doesn't apply). Include per-dimension key findings with file:line CITATIONS. Do not emit GATE_VERDICT — you are advisory.`,
       workflowName,
+      // Calibration is a cold first look every time it runs; it is never a
+      // re-run of the external reviewer's own work.
+      0,
     );
   } catch (err) {
     // Calibration is advisory; a failed session fails open (skip it) rather than
@@ -1688,6 +1741,7 @@ async function runRoleSession(
   role: TeamRole,
   message: string,
   workflowName: string,
+  attempt: number,
 ): Promise<string> {
   // The runtime is responsible for the deployment-vs-sdk check
   // (ManagedAgentsRuntime errors loudly if the role isn't deployed;
@@ -1700,15 +1754,8 @@ async function runRoleSession(
     agentId: entry?.agentId ?? `sdk:${role}`,
     agentRole: role,
     workflow: workflowName,
+    attempt,
   });
-  // Best-effort per-role perf metrics — managed-agents only (a no-op on the
-  // other transports). A metrics write must never break the role session.
-  try {
-    await runtime.collectSessionMetrics?.(session.id);
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    console.log(`${DIM}Perf metrics not recorded for ${role} (${msg}).${RESET}`);
-  }
   return output;
 }
 
@@ -1727,6 +1774,12 @@ export interface StreamOptions {
   model?: string;
   /** Hard cap on advisor consultations per session. Default: 3. */
   maxAdvisorCalls?: number;
+  /**
+   * Which attempt this session is: 0 for a role's first run, one more for each
+   * time a gate sent the work back. Anything above zero is a revision, and that
+   * is what the per-role table counts.
+   */
+  attempt?: number;
 }
 
 /**
@@ -1762,6 +1815,17 @@ export async function streamSessionWithAdvisor(
   let output = '';
   let sessionCost = 0;
   let advisorCalls = 0;
+  // What this session produced, counted where it arrives. The stream is the
+  // one surface every transport has, so a total read off it is a total for
+  // every transport; asking a session's own API for it afterwards answers for
+  // the transport that has that API and answers zero for the rest.
+  let inputTokens = 0;
+  let outputTokens = 0;
+  let selfEvalPass = 0;
+  let selfEvalFail = 0;
+  // A revision is a decision the workflow made, not a word to look for in what
+  // the model wrote back.
+  const revisions = (options?.attempt ?? 0) > 0 ? 1 : 0;
   const maxAdvisorCalls = options?.maxAdvisorCalls ?? 3;
   const pendingToolCalls = new Map<
     string,
@@ -1769,6 +1833,17 @@ export async function streamSessionWithAdvisor(
   >();
 
   for await (const event of session.events) {
+    if (event.type === 'agent.message') {
+      const verdict = parseSelfEval(
+        event.content
+          .filter((c) => c.type === 'text')
+          .map((c) => c.text)
+          .join(''),
+      );
+      if (verdict === 'pass') selfEvalPass += 1;
+      if (verdict === 'fail') selfEvalFail += 1;
+    }
+
     const formatted = formatEvent(event);
     if (formatted) {
       process.stdout.write(formatted);
@@ -1780,10 +1855,24 @@ export async function streamSessionWithAdvisor(
       }
     }
 
-    // Track cost from model request spans (managed-agents transport). Priced
-    // through the shared, model+cache-aware estimator using the role's model.
+    // Cost accumulates from per-request spans, priced through the shared
+    // estimator. This is the only signal that arrives while a session can still
+    // be stopped, so it is what a ceiling has to be compared against.
+    //
+    // What it is compared against is an estimate, and it is worth being exact
+    // about how it differs from the bill. It applies this repository's rate
+    // card to the token counts a transport reports, at the caller's model where
+    // one is given and at the default tier where none is — the revision path
+    // resumes a session by id and has no role to name, so a turn there is
+    // priced at that tier whatever model ran, which for an opus role is 1.667x
+    // low. The run's own total replaces this number at idle, so the record is
+    // the billed one and only the ceiling is compared against the estimate:
+    // where they differ, what moves is when a session is stopped, not what it
+    // is reported to have cost.
     if (event.type === 'span.model_request_end' && !event.is_error) {
       sessionCost += estimateCost(event.model_usage, options?.model);
+      inputTokens += event.model_usage.input_tokens;
+      outputTokens += event.model_usage.output_tokens;
 
       // Budget enforcement
       if (budgetLimit !== null && sessionCost > budgetLimit) {
@@ -1803,10 +1892,11 @@ export async function streamSessionWithAdvisor(
       }
     }
 
-    // Native run cost from the SDK / claude-cli result message. Those transports
-    // don't emit cost spans; the Agent SDK / Claude Code report a final
-    // total_cost_usd on the result, which sdk-events attaches to status_idle.
-    // managed-agents leaves it unset (cost is accumulated from spans above).
+    // The run's own total, reported on the result by the transports that have
+    // one. It reconciles the summed spans against what was actually billed, and
+    // it arrives at the end — after the point where a ceiling could act — so it
+    // corrects the record rather than enforcing anything. managed-agents leaves
+    // it unset and the accumulated total stands.
     if (event.type === 'session.status_idle' && typeof event.total_cost_usd === 'number') {
       sessionCost = event.total_cost_usd;
     }
@@ -1947,6 +2037,34 @@ export async function streamSessionWithAdvisor(
       }
       process.stdout.write('\n');
       break;
+    }
+  }
+
+  // Recorded once the stream has ended, by whichever end it reached: idle, a
+  // reported error, a termination, or the ceiling interrupting the session.
+  // Every one of those leaves the loop above, and the spend up to that point is
+  // spend either way.
+  //
+  // A session resumed by id has no role to attribute to — the revision path
+  // sends one and names no role, which is the same fact that prices its turns
+  // at the default tier — so it is streamed and not recorded, rather than
+  // recorded against a role that did not run it.
+  if (options?.agentRole) {
+    try {
+      await recordSessionMetrics({
+        role: options.agentRole,
+        inputTokens,
+        outputTokens,
+        costUsd: sessionCost,
+        advisorCalls,
+        selfEvalPass,
+        selfEvalFail,
+        revisions,
+      });
+    } catch (err) {
+      // A metrics write must never take the role's output with it.
+      const msg = err instanceof Error ? err.message : String(err);
+      process.stdout.write(`${DIM}Perf metrics not recorded (${msg}).${RESET}\n`);
     }
   }
   return output;
